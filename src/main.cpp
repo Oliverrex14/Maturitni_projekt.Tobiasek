@@ -33,6 +33,7 @@ String modemBuffer = "";
 bool mamRealnyFix = false;
 bool prvniVykresleni = true;
 int posledniSats = -1;
+String posledniUTC = "";
 
 // Pomocná funkce pro spolehlivé odeslání AT příkazu a čekání na odpověď OK
 bool sendAT(const char* cmd, unsigned long timeout = 2000) {
@@ -165,8 +166,19 @@ void drawEinkData(bool hasFix, String lat, String lon, int sats, float course) {
       display.setCursor(10, 80);
       display.print("Lon: " + lon);
     } else {
-      display.setCursor(10, 65);
+      display.setCursor(10, 55);
       display.print("Hledam satelity...");
+      display.setFont(); // Menší font pro živý stav
+      display.setCursor(10, 75);
+      display.print("Cas behu: " + String(millis() / 1000) + " s");
+      if (posledniUTC.length() >= 14) {
+        String hh = posledniUTC.substring(8, 10);
+        String mm = posledniUTC.substring(10, 12);
+        String ss = posledniUTC.substring(12, 14);
+        display.setCursor(10, 88);
+        display.print("Sat UTC: " + hh + ":" + mm + ":" + ss);
+      }
+      display.setFont(&FreeSans9pt7b);
     }
 
     // ==========================================
@@ -201,11 +213,15 @@ void parseGPS(String data) {
   }
   values[index] = data.substring(startIndex); 
 
-  // Počet satelitů (index 14 = viditelné, index 15 = použité)
-  int sats = values[14].toInt();
-  if (sats == 0 && values[15].length() > 0) {
-    sats = values[15].toInt();
-  }
+  // Uložení případného času ze satelitu (index 2)
+  posledniUTC = values[2];
+
+  // Počet satelitů (index 14 = viditelné satelity, index 15 = použité pro fix)
+  int gpsView = values[14].toInt();
+  int gnssUsed = values[15].toInt();
+  int sats = max(gpsView, gnssUsed);
+  // Pojistka proti vyčtení HPA (9999000.0), pokud má firmware méně polí
+  if (sats > 100) sats = 0;
 
   // Přísná kontrola, že máme opravdu platný satelitní fix a reálná čísla souřadnic
   bool validFix = (values[1] == "1") && 
@@ -219,8 +235,8 @@ void parseGPS(String data) {
     String lon = values[4];
     float course = (values[7].length() > 0) ? values[7].toFloat() : -1.0;
 
-    // Pokud jsme právě získali první fix, nebo uplynulo 30 s od posledního překreslení
-    if (!mamRealnyFix || (millis() - lastDrawTime >= 30000) || prvniVykresleni) {
+    // Aktivní obnovování na displeji každých 5 vteřin (nebo okamžitě při prvním fixu)
+    if (!mamRealnyFix || (millis() - lastDrawTime >= 5000) || prvniVykresleni) {
       mamRealnyFix = true;
       prvniVykresleni = false;
       posledniSats = sats;
@@ -229,9 +245,8 @@ void parseGPS(String data) {
     }
   } else {
     mamRealnyFix = false;
-    // Dokud čekáme na satelity, překreslíme stav okamžitě při změně počtu satelitů (min. rozestup 10 s kvůli E-inku) nebo každých 30 s
-    bool zmenaSatelitu = (sats != posledniSats) && (millis() - lastDrawTime >= 10000);
-    if (zmenaSatelitu || (millis() - lastDrawTime >= 30000) || prvniVykresleni) {
+    // Aktivní obnovování při hledání: okamžitě při změně počtu satelitů nebo každých 5 vteřin
+    if ((sats != posledniSats) || (millis() - lastDrawTime >= 5000) || prvniVykresleni) {
       prvniVykresleni = false;
       posledniSats = sats;
       lastDrawTime = millis();
@@ -250,12 +265,12 @@ void setup() {
 
   PMU.setDC1Voltage(3300);
   PMU.enableDC1();          // Napájení pro E-ink a 3.3V periferie
-  PMU.setDC3Voltage(3400);  // Doporučené napětí pro SIM7080G (3.4V pro stabilní příjem)
-  PMU.enableDC3();          // Hlavní napájení modemu
+  PMU.setDC3Voltage(3000);  // Přesně 3000 mV podle oficiálního příkladu LilyGO
+  PMU.enableDC3();          // Hlavní napájení modemu (nevypínáme při resetu, aby si pamatoval satelity!)
   PMU.setBLDO1Voltage(3300);
   PMU.enableBLDO1();        // Napájení převodníků komunikace
   PMU.setBLDO2Voltage(3300);
-  PMU.enableBLDO2();        // Napájení pro GPS
+  PMU.enableBLDO2();        // Napájení pro aktivní GPS anténu (LNA)
   PMU.disableTSPinMeasure(); 
   PMU.enableBattDetection();      // Zapnutí hardwarové detekce připojené baterie
   PMU.enableBattVoltageMeasure(); // Zapnutí ADC měření skutečného napětí baterie
@@ -277,8 +292,7 @@ void setup() {
     digitalWrite(BOARD_MODEM_PWR_PIN, HIGH);
     delay(1000);
     digitalWrite(BOARD_MODEM_PWR_PIN, LOW);
-    
-    // Počkáme, až modem opravdu naběhne a začne odpovídat na AT příkazy
+
     int pokusy = 0;
     while (!jeModemZapnuty() && pokusy < 15) {
       delay(500);
@@ -286,17 +300,14 @@ void setup() {
     }
   }
 
-  // 4. Rychlá konfigurace GPS bez SIM karty
-  sendAT("ATE0", 1000);                // Vypnutí echa pro čistší komunikaci
-  sendAT("AT+CFUN=0,0", 5000);         // Okamžité vypnutí mobilního rádia (nehledá SIM ani mobilní síť)
-  sendAT("AT+CGNSPWR=0", 2000);        // Vypnutí GNSS před změnou konfigurace konstelací
-  sendAT("AT+SGPIO=0,5,1,1", 2000);    // Zapnutí napájení aktivní GPS antény (LNA)
-  // Zapnutí GPS + GLONASS + BeiDou + Galileo (4 parametry dle specifikace SIM7080G)
-  if (!sendAT("AT+CGNSMOD=1,1,1,1", 2000)) {
-    sendAT("AT+CGNSMOD=1,1,1,1,1", 2000); // Záložní varianta pro jinou revizi firmwaru
-  }
-  sendAT("AT+CGNSPWR=1", 2000);        // Zapnutí GNSS enginu
-  sendAT("AT+CGNSHOT", 2000);          // Vynucení Hot Startu (využije uložené efemeridy v RTC modemu)
+  // 4. Zapnutí aktivní antény a GPS + GLONASS ve správném pořadí
+  sendAT("ATE0", 1000);
+  sendAT("AT+CGNSPWR=0", 2000);        // Nejprve vypnout GNSS
+  sendAT("AT+CFUN=4", 5000);           // Flight mode (vypne mobilní rádio, nechá čisté GPS)
+  sendAT("AT+CGNSMOD=1,1,0,0,0", 2000);// GPS + GLONASS (vrací OK)
+  sendAT("AT+SGPIO=0,5,1,1", 2000);    // Napájení aktivní antény (GPIO 5)
+  sendAT("AT+SGPIO=0,4,1,1", 2000);    // Napájení aktivní antény (GPIO 4)
+  sendAT("AT+CGNSPWR=1", 2000);        // Zapnout GNSS engine
 }
 
 void loop() {
@@ -317,9 +328,8 @@ void loop() {
     }
   }
 
-  // Dotaz na modem: každé 2 vteřiny při hledání satelitů, každých 5 vteřin po zaměření
-  unsigned long queryInterval = mamRealnyFix ? 5000 : 2000;
-  if (millis() - lastQueryTime >= queryInterval) {
+  // Aktivní dotaz na modem každou 1 vteřinu
+  if (millis() - lastQueryTime >= 1000) {
     lastQueryTime = millis();
     Serial1.println("AT+CGNSINF");
   }
