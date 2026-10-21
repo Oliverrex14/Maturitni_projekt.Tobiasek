@@ -32,18 +32,39 @@ unsigned long lastDrawTime = 0;
 String modemBuffer = ""; 
 bool mamRealnyFix = false;
 bool prvniVykresleni = true;
+int posledniSats = -1;
+
+// Pomocná funkce pro spolehlivé odeslání AT příkazu a čekání na odpověď OK
+bool sendAT(const char* cmd, unsigned long timeout = 2000) {
+  while (Serial1.available()) Serial1.read();
+  Serial1.println(cmd);
+  Serial.print(">> ");
+  Serial.println(cmd);
+  unsigned long start = millis();
+  String resp = "";
+  while (millis() - start < timeout) {
+    while (Serial1.available()) {
+      char c = Serial1.read();
+      resp += c;
+      if (resp.indexOf("OK") != -1) {
+        Serial.println("   OK");
+        return true;
+      }
+      if (resp.indexOf("ERROR") != -1) {
+        Serial.println("   ERROR");
+        return false;
+      }
+    }
+  }
+  Serial.println("   TIMEOUT");
+  return false;
+}
 
 // Kontrola, zda už modem běží (aby ho nový nahrávaný kód omylem nevypnul)
 bool jeModemZapnuty() {
-  while (Serial1.available()) Serial1.read();
-  Serial1.println("AT");
-  unsigned long start = millis();
-  String resp = "";
-  while (millis() - start < 500) {
-    while (Serial1.available()) {
-      resp += (char)Serial1.read();
-      if (resp.indexOf("OK") != -1) return true;
-    }
+  for (int i = 0; i < 3; i++) {
+    if (sendAT("AT", 500)) return true;
+    delay(100);
   }
   return false;
 }
@@ -64,8 +85,19 @@ String getCompassDirection(float course) {
 
 // Hlavní funkce pro kreslení na E-ink displej
 void drawEinkData(bool hasFix, String lat, String lon, int sats, float course) {
-  int batPercent = PMU.getBatteryPercent();
-  if (batPercent < 0) batPercent = 0;
+  bool batConnected = PMU.isBatteryConnect();
+  int batPercent = -1;
+
+  if (batConnected) {
+    uint16_t volt = PMU.getBattVoltage(); // Skutečné napětí v mV z ADC
+    batPercent = PMU.getBatteryPercent(); // Procenta z fuel gauge čipu
+    
+    // Pokud fuel gauge ještě není zkalibrovaný nebo vrací nesmyslnou hodnotu, vypočítáme procenta přímo z napětí Li-Pol (3300 mV = 0 %, 4200 mV = 100 %)
+    if ((batPercent <= 0 || batPercent > 100) && volt > 2500) {
+      batPercent = map(constrain(volt, 3300, 4200), 3300, 4200, 0, 100);
+    }
+    batPercent = constrain(batPercent, 0, 100);
+  }
   
   display.setRotation(1); // Otočení na šířku
   display.setFullWindow();
@@ -105,11 +137,19 @@ void drawEinkData(bool hasFix, String lat, String lon, int sats, float course) {
     display.drawRect(bx, by, bw, bh, GxEPD_BLACK);
     display.fillRect(bx + bw, by + 2, 2, 6, GxEPD_BLACK);
     
-    int fillW = map(batPercent, 0, 100, 0, bw - 2);
-    display.fillRect(bx + 1, by + 1, fillW, bh - 2, GxEPD_BLACK);
-    
-    display.setCursor(bx + bw + 5, by + 1);
-    display.print(String(batPercent) + "%");
+    if (batConnected && batPercent >= 0) {
+      int fillW = map(batPercent, 0, 100, 0, bw - 2);
+      if (fillW > 0) {
+        display.fillRect(bx + 1, by + 1, fillW, bh - 2, GxEPD_BLACK);
+      }
+      display.setCursor(bx + bw + 5, by + 1);
+      display.print(String(batPercent) + "%");
+    } else {
+      // Baterie není připojená (běží jen z USB)
+      display.drawLine(bx + 2, by + 2, bx + bw - 3, by + bh - 3, GxEPD_BLACK);
+      display.setCursor(bx + bw + 5, by + 1);
+      display.print("--%");
+    }
 
     // Oddělovací čára
     display.drawLine(0, 20, display.width(), 20, GxEPD_BLACK);
@@ -179,18 +219,21 @@ void parseGPS(String data) {
     String lon = values[4];
     float course = (values[7].length() > 0) ? values[7].toFloat() : -1.0;
 
-    // Pokud jsme právě získali první fix, nebo uplynula 1 minuta od posledního překreslení
+    // Pokud jsme právě získali první fix, nebo uplynulo 30 s od posledního překreslení
     if (!mamRealnyFix || (millis() - lastDrawTime >= 30000) || prvniVykresleni) {
       mamRealnyFix = true;
       prvniVykresleni = false;
+      posledniSats = sats;
       lastDrawTime = millis();
       drawEinkData(true, lat, lon, sats, course);
     }
   } else {
     mamRealnyFix = false;
-    // Dokud čekáme na satelity, překreslíme stav na displeji jednou za minutu
-    if ((millis() - lastDrawTime >= 30000) || prvniVykresleni) {
+    // Dokud čekáme na satelity, překreslíme stav okamžitě při změně počtu satelitů (min. rozestup 10 s kvůli E-inku) nebo každých 30 s
+    bool zmenaSatelitu = (sats != posledniSats) && (millis() - lastDrawTime >= 10000);
+    if (zmenaSatelitu || (millis() - lastDrawTime >= 30000) || prvniVykresleni) {
       prvniVykresleni = false;
+      posledniSats = sats;
       lastDrawTime = millis();
       drawEinkData(false, "", "", sats, -1.0);
     }
@@ -207,13 +250,15 @@ void setup() {
 
   PMU.setDC1Voltage(3300);
   PMU.enableDC1();          // Napájení pro E-ink a 3.3V periferie
-  PMU.setDC3Voltage(3000);
+  PMU.setDC3Voltage(3400);  // Doporučené napětí pro SIM7080G (3.4V pro stabilní příjem)
   PMU.enableDC3();          // Hlavní napájení modemu
   PMU.setBLDO1Voltage(3300);
   PMU.enableBLDO1();        // Napájení převodníků komunikace
   PMU.setBLDO2Voltage(3300);
   PMU.enableBLDO2();        // Napájení pro GPS
   PMU.disableTSPinMeasure(); 
+  PMU.enableBattDetection();      // Zapnutí hardwarové detekce připojené baterie
+  PMU.enableBattVoltageMeasure(); // Zapnutí ADC měření skutečného napětí baterie
   delay(300);
 
   // 2. Inicializace E-ink displeje a zobrazení výchozího čekání
@@ -232,20 +277,26 @@ void setup() {
     digitalWrite(BOARD_MODEM_PWR_PIN, HIGH);
     delay(1000);
     digitalWrite(BOARD_MODEM_PWR_PIN, LOW);
-    delay(3000);
+    
+    // Počkáme, až modem opravdu naběhne a začne odpovídat na AT příkazy
+    int pokusy = 0;
+    while (!jeModemZapnuty() && pokusy < 15) {
+      delay(500);
+      pokusy++;
+    }
   }
 
-  // 4. Konfigurace skutečné GPS (všechny satelitní systémy)
-  Serial1.println("AT");
-  delay(500);
-  Serial1.println("AT+CFUN=0");
-  delay(1000);
-  Serial1.println("AT+SGPIO=0,5,1,1");
-  delay(1000);
-  Serial1.println("AT+CGNSMOD=1,1,1,1,1");
-  delay(1000);
-  Serial1.println("AT+CGNSPWR=1");
-  delay(1000);
+  // 4. Rychlá konfigurace GPS bez SIM karty
+  sendAT("ATE0", 1000);                // Vypnutí echa pro čistší komunikaci
+  sendAT("AT+CFUN=0,0", 5000);         // Okamžité vypnutí mobilního rádia (nehledá SIM ani mobilní síť)
+  sendAT("AT+CGNSPWR=0", 2000);        // Vypnutí GNSS před změnou konfigurace konstelací
+  sendAT("AT+SGPIO=0,5,1,1", 2000);    // Zapnutí napájení aktivní GPS antény (LNA)
+  // Zapnutí GPS + GLONASS + BeiDou + Galileo (4 parametry dle specifikace SIM7080G)
+  if (!sendAT("AT+CGNSMOD=1,1,1,1", 2000)) {
+    sendAT("AT+CGNSMOD=1,1,1,1,1", 2000); // Záložní varianta pro jinou revizi firmwaru
+  }
+  sendAT("AT+CGNSPWR=1", 2000);        // Zapnutí GNSS enginu
+  sendAT("AT+CGNSHOT", 2000);          // Vynucení Hot Startu (využije uložené efemeridy v RTC modemu)
 }
 
 void loop() {
@@ -254,6 +305,9 @@ void loop() {
     char c = Serial1.read();
     if (c == '\n') { 
       modemBuffer.trim(); 
+      if (modemBuffer.length() > 0) {
+        Serial.println(modemBuffer);
+      }
       if (modemBuffer.startsWith("+CGNSINF:")) {
         parseGPS(modemBuffer);
       } 
@@ -263,8 +317,9 @@ void loop() {
     }
   }
 
-  // Dotaz na modem každých 5 vteřin (samotný displej se ale překreslí až při chycení satelitů a pak každou 1 minutu)
-  if (millis() - lastQueryTime >= 5000) {
+  // Dotaz na modem: každé 2 vteřiny při hledání satelitů, každých 5 vteřin po zaměření
+  unsigned long queryInterval = mamRealnyFix ? 5000 : 2000;
+  if (millis() - lastQueryTime >= queryInterval) {
     lastQueryTime = millis();
     Serial1.println("AT+CGNSINF");
   }
