@@ -6,6 +6,9 @@
 // Knihovny pro E-ink
 #include <GxEPD2_BW.h>
 #include <Fonts/FreeSans9pt7b.h>
+#include <Fonts/FreeSansBold9pt7b.h>
+#include <Fonts/FreeMonoBold9pt7b.h>
+#include <math.h>
 
 XPowersAXP2101 PMU;
 
@@ -84,115 +87,215 @@ String getCompassDirection(float course) {
   return "--";
 }
 
-// Hlavní funkce pro kreslení na E-ink displej
+// Hlavní funkce pro kreslení na E-ink displej (Moderní Dashboard UI)
 void drawEinkData(bool hasFix, String lat, String lon, int sats, float course) {
   bool batConnected = PMU.isBatteryConnect();
+  bool isCharging = PMU.isCharging();
   int batPercent = -1;
+  uint16_t batVolt = 0;
 
   if (batConnected) {
-    uint16_t volt = PMU.getBattVoltage(); // Skutečné napětí v mV z ADC
+    batVolt = PMU.getBattVoltage();       // Skutečné napětí v mV z ADC
     batPercent = PMU.getBatteryPercent(); // Procenta z fuel gauge čipu
     
-    // Pokud fuel gauge ještě není zkalibrovaný nebo vrací nesmyslnou hodnotu, vypočítáme procenta přímo z napětí Li-Pol (3300 mV = 0 %, 4200 mV = 100 %)
-    if ((batPercent <= 0 || batPercent > 100) && volt > 2500) {
-      batPercent = map(constrain(volt, 3300, 4200), 3300, 4200, 0, 100);
+    // Záložní výpočet z napětí Li-Pol (3300 mV = 0 %, 4200 mV = 100 %)
+    if ((batPercent <= 0 || batPercent > 100) && batVolt > 2500) {
+      batPercent = map(constrain(batVolt, 3300, 4200), 3300, 4200, 0, 100);
     }
     batPercent = constrain(batPercent, 0, 100);
   }
   
-  display.setRotation(1); // Otočení na šířku
-  display.setFullWindow();
+  display.setRotation(1); // 250 x 122 px na šířku
+  // První vykreslení udělá plný refresh, další překreslení rychlé částečné okno bez nepříjemného černobílého blikání
+  if (prvniVykresleni) {
+    display.setFullWindow();
+  } else {
+    display.setPartialWindow(0, 0, display.width(), display.height());
+  }
+
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
-    display.setTextColor(GxEPD_BLACK);
     
-    // ==========================================
-    // 1. HORNÍ LIŠTA: Signál GPS (vlevo nahoře)
-    // ==========================================
+    // =========================================================
+    // 1. HORNÍ TMAVÁ STAVOVÁ LIŠTA (250 x 22 px)
+    // =========================================================
+    display.fillRect(0, 0, display.width(), 22, GxEPD_BLACK);
+    display.setTextColor(GxEPD_WHITE);
+    display.setFont(); // Ostrý pixelový font 6x8 do stavové lišty
+
+    // Vlevo: Ikona satelitu / signálu + počet družic
     int bars = 0;
-    if (sats >= 3) bars = 1;
-    if (sats >= 5) bars = 2;
-    if (sats >= 7) bars = 3;
-    if (sats >= 9) bars = 4;
+    if (sats >= 1) bars = 1;
+    if (sats >= 3) bars = 2;
+    if (sats >= 5) bars = 3;
+    if (sats >= 8) bars = 4;
 
     for (int i = 0; i < 4; i++) {
-      int h = (i + 1) * 3;
-      int x = 5 + (i * 6);
-      int y = 16 - h;
-      if (i < bars) display.fillRect(x, y, 4, h, GxEPD_BLACK);
-      else          display.drawRect(x, y, 4, h, GxEPD_BLACK);
+      int h = (i + 1) * 3 + 2;
+      int x = 6 + (i * 5);
+      int y = 18 - h;
+      if (i < bars) display.fillRect(x, y, 3, h, GxEPD_WHITE);
+      else          display.drawRect(x, y, 3, h, GxEPD_WHITE);
     }
-    
-    display.setFont(); // Malý systémový font
-    display.setCursor(35, 8);
-    display.print(String(sats) + " Sat");
+    display.setCursor(29, 7);
+    display.print(String(sats) + " SAT");
 
-    // ==========================================
-    // 2. HORNÍ LIŠTA: Baterie (vpravo nahoře)
-    // ==========================================
-    int bw = 24, bh = 10;
-    int bx = display.width() - bw - 35; 
+    // Uprostřed: Status pill (LIVE FIX vs SEARCHING)
+    String statusBadge = hasFix ? "GPS FIX" : "HLEDAM";
+    int badgeW = hasFix ? 52 : 46;
+    int badgeX = (display.width() - badgeW) / 2;
+    if (hasFix) {
+      display.fillRoundRect(badgeX, 3, badgeW, 16, 4, GxEPD_WHITE);
+      display.setTextColor(GxEPD_BLACK);
+      display.setCursor(badgeX + 5, 7);
+      display.print(statusBadge);
+      display.setTextColor(GxEPD_WHITE);
+    } else {
+      display.drawRoundRect(badgeX, 3, badgeW, 16, 4, GxEPD_WHITE);
+      display.setCursor(badgeX + 5, 7);
+      display.print(statusBadge);
+    }
+
+    // Vpravo: Moderní ikona baterie + reálná procenta
+    int bw = 22, bh = 11;
+    int bx = display.width() - bw - 34; 
     int by = 5;
-    
-    display.drawRect(bx, by, bw, bh, GxEPD_BLACK);
-    display.fillRect(bx + bw, by + 2, 2, 6, GxEPD_BLACK);
+    display.drawRoundRect(bx, by, bw, bh, 2, GxEPD_WHITE);
+    display.fillRect(bx + bw, by + 3, 2, 5, GxEPD_WHITE);
     
     if (batConnected && batPercent >= 0) {
-      int fillW = map(batPercent, 0, 100, 0, bw - 2);
+      int fillW = map(batPercent, 0, 100, 0, bw - 4);
       if (fillW > 0) {
-        display.fillRect(bx + 1, by + 1, fillW, bh - 2, GxEPD_BLACK);
+        display.fillRect(bx + 2, by + 2, fillW, bh - 4, GxEPD_WHITE);
       }
-      display.setCursor(bx + bw + 5, by + 1);
-      display.print(String(batPercent) + "%");
+      display.setCursor(bx + bw + 5, 7);
+      display.print(String(batPercent) + (isCharging ? "+" : "%"));
     } else {
-      // Baterie není připojená (běží jen z USB)
-      display.drawLine(bx + 2, by + 2, bx + bw - 3, by + bh - 3, GxEPD_BLACK);
-      display.setCursor(bx + bw + 5, by + 1);
-      display.print("--%");
+      display.drawLine(bx + 3, by + 2, bx + bw - 4, by + bh - 3, GxEPD_WHITE);
+      display.setCursor(bx + bw + 5, 7);
+      display.print("USB");
     }
 
-    // Oddělovací čára
-    display.drawLine(0, 20, display.width(), 20, GxEPD_BLACK);
+    display.setTextColor(GxEPD_BLACK);
 
-    // ==========================================
-    // 3. STŘED: Skutečné souřadnice ze satelitu
-    // ==========================================
-    display.setFont(&FreeSans9pt7b);
-    
+    // =========================================================
+    // 2. HLAVNÍ KARTA SOUŘADNIC (Vlevo: 6 až 168 px)
+    // =========================================================
+    display.drawRoundRect(5, 27, 164, 72, 5, GxEPD_BLACK);
+
     if (hasFix) {
-      display.setCursor(10, 55);
-      display.print("Lat:  " + lat);
-      display.setCursor(10, 80);
-      display.print("Lon: " + lon);
+      // Štítky LAT a LON v inverzních kapslích
+      display.fillRoundRect(11, 35, 28, 15, 3, GxEPD_BLACK);
+      display.setTextColor(GxEPD_WHITE);
+      display.setFont();
+      display.setCursor(16, 39);
+      display.print("LAT");
+
+      display.fillRoundRect(11, 66, 28, 15, 3, GxEPD_BLACK);
+      display.setCursor(16, 70);
+      display.print("LON");
+
+      // Hodnoty souřadnic tučným moderním fontem
+      display.setTextColor(GxEPD_BLACK);
+      display.setFont(&FreeMonoBold9pt7b);
+      display.setCursor(45, 48);
+      display.print(lat.substring(0, 9));
+      display.setCursor(45, 79);
+      display.print(lon.substring(0, 9));
+
+      // Jemná dělicí linka mezi LAT a LON
+      display.drawLine(11, 58, 162, 58, GxEPD_BLACK);
     } else {
-      display.setCursor(10, 55);
-      display.print("Hledam satelity...");
-      display.setFont(); // Menší font pro živý stav
-      display.setCursor(10, 75);
-      display.print("Cas behu: " + String(millis() / 1000) + " s");
-      if (posledniUTC.length() >= 14) {
-        String hh = posledniUTC.substring(8, 10);
-        String mm = posledniUTC.substring(10, 12);
-        String ss = posledniUTC.substring(12, 14);
-        display.setCursor(10, 88);
-        display.print("Sat UTC: " + hh + ":" + mm + ":" + ss);
-      }
-      display.setFont(&FreeSans9pt7b);
+      // Radarová ikona hledání satelitů vlevo v kartě
+      int rx = 28, ry = 56;
+      display.drawCircle(rx, ry, 14, GxEPD_BLACK);
+      display.drawCircle(rx, ry, 8, GxEPD_BLACK);
+      display.fillCircle(rx, ry, 2, GxEPD_BLACK);
+      display.drawLine(rx, ry, rx + 10, ry - 10, GxEPD_BLACK);
+
+      display.setFont(&FreeSansBold9pt7b);
+      display.setCursor(50, 52);
+      display.print("Hledam GPS");
+
+      display.setFont();
+      display.setCursor(50, 62);
+      display.print("Cekam na signal...");
+
+      // Progress / status lišta ve spodní části karty
+      display.drawRoundRect(12, 80, 150, 12, 3, GxEPD_BLACK);
+      int animW = ((millis() / 1000) % 10) * 14 + 10;
+      if (animW > 146) animW = 146;
+      display.fillRoundRect(14, 82, animW, 8, 2, GxEPD_BLACK);
     }
 
-    // ==========================================
-    // 4. VPRAVO DOLE: Kompas
-    // ==========================================
+    // =========================================================
+    // 3. KRUHOVÝ KOMPAS (Vpravo: 174 až 245 px)
+    // =========================================================
+    display.drawRoundRect(174, 27, 71, 72, 5, GxEPD_BLACK);
+    int cx = 209, cy = 56, cr = 20;
+    display.drawCircle(cx, cy, cr, GxEPD_BLACK);
+    display.drawCircle(cx, cy, cr - 1, GxEPD_BLACK);
+
+    // Značky světových stran na ciferníku
+    display.setFont();
+    display.setCursor(cx - 2, cy - cr + 3);
+    display.print("S");
+    display.drawPixel(cx + cr - 2, cy, GxEPD_BLACK);
+    display.drawPixel(cx - cr + 2, cy, GxEPD_BLACK);
+    display.drawPixel(cx, cy + cr - 2, GxEPD_BLACK);
+
+    // Střelka kompasu nebo středový bod
+    if (course >= 0) {
+      float rad = (course - 90.0) * PI / 180.0;
+      int tipX = cx + (int)(cos(rad) * (cr - 5));
+      int tipY = cy + (int)(sin(rad) * (cr - 5));
+      display.drawLine(cx, cy, tipX, tipY, GxEPD_BLACK);
+      display.fillCircle(tipX, tipY, 2, GxEPD_BLACK);
+      display.fillCircle(cx, cy, 2, GxEPD_BLACK);
+    } else {
+      display.fillCircle(cx, cy, 2, GxEPD_BLACK);
+      display.drawLine(cx - 5, cy, cx + 5, cy, GxEPD_BLACK);
+    }
+
+    // Text směru pod kompasem
     String compassText = getCompassDirection(course);
-    String fullCompassStr = "Smer: " + compassText;
-    if (course >= 0) fullCompassStr += " (" + String((int)course) + ")";
-    
+    if (course >= 0) compassText += " " + String((int)course) + "st";
+    else             compassText = "SMER: --";
     int16_t tbx, tby; uint16_t tbw, tbh;
-    display.getTextBounds(fullCompassStr, 0, 0, &tbx, &tby, &tbw, &tbh);
+    display.getTextBounds(compassText, 0, 0, &tbx, &tby, &tbw, &tbh);
+    display.setCursor(174 + (71 - tbw) / 2, 87);
+    display.print(compassText);
+
+    // =========================================================
+    // 4. SPODNÍ INFORMAČNÍ PATIČKA (103 až 122 px)
+    // =========================================================
+    display.drawLine(5, 104, display.width() - 6, 104, GxEPD_BLACK);
+    display.setFont();
     
-    display.setCursor(display.width() - tbw - 5, display.height() - 5);
-    display.print(fullCompassStr);
+    // Vlevo dole: Čas ze satelitu (nebo stav synchronizace)
+    display.setCursor(6, 110);
+    if (posledniUTC.length() >= 14) {
+      String hh = posledniUTC.substring(8, 10);
+      String mm = posledniUTC.substring(10, 12);
+      String ss = posledniUTC.substring(12, 14);
+      display.print("UTC " + hh + ":" + mm + ":" + ss);
+    } else {
+      display.print("UTC --:--:--");
+    }
+
+    // Uprostřed dole: Napětí baterie v mV / V
+    if (batConnected && batVolt > 0) {
+      display.setCursor(98, 110);
+      display.print(String(batVolt / 1000.0, 2) + "V");
+    }
+
+    // Vpravo dole: Čas běhu (Uptime)
+    unsigned long sec = millis() / 1000;
+    String uptimeStr = "BEH " + String(sec / 60) + "m" + String(sec % 60) + "s";
+    display.getTextBounds(uptimeStr, 0, 0, &tbx, &tby, &tbw, &tbh);
+    display.setCursor(display.width() - tbw - 6, 110);
+    display.print(uptimeStr);
 
   } while (display.nextPage());
 }
@@ -280,6 +383,7 @@ void setup() {
   SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
   display.init(0, true, 2, false); 
   drawEinkData(false, "", "", 0, -1.0);
+  prvniVykresleni = false;
   lastDrawTime = millis();
 
   // 3. Spuštění sériové linky a zapnutí modemu (pokud ještě neběží)
